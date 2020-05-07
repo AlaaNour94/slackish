@@ -1,55 +1,71 @@
 import re
+import shlex
 import logging
-from time import sleep
+
+import slack
+
+from threading import Lock
+from slack import WebClient, RTMClient
 
 logging.basicConfig()
-logger = logging.getLogger()
+logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
-class Command(object):
+class SingletonMeta(type):
+    """This is a thread-safe implementation of Singleton."""
+
+    _instance = None
+
+    _lock = Lock()
+
+    def __call__(cls, *args, **kwargs):
+        with cls._lock:
+            if not cls._instance:
+                cls._instance = super().__call__(*args, **kwargs)
+        return cls._instance
+
+
+class Command:
+
     registry = dict()
 
     def __init__(self, fn):
-        self.registry[fn.__name__] = {
-            'cmd': fn,
-            'argnames': fn.__code__.co_varnames,
-            'help': fn.__doc__
-        }
+        self.registry[fn.__name__] = {'cmd': fn, 'argnames': fn.__code__.co_varnames, 'help': fn.__doc__}
         self._fn = fn
 
     def __call__(self, *args, **kwargs):
         self._fn(*args, **kwargs)
 
 
-class Slackish(object):
+class Slackish(metaclass=SingletonMeta):
+
     message_queue = []
     default_error_message = "Something went wrong!"
 
-    def __init__(self, slack_client, registry, **kwargs):
-        # instantiate Slack
-        self.slack_client = slack_client(kwargs.get('SLACK_BOT_TOKEN'))
-        self.RTM_READ_DELAY = kwargs.get('RTM_READ_DELAY', 1)
+    def __init__(self, registry, **kwargs):
+        self.token = kwargs.get('SLACK_BOT_TOKEN')
         self.MENTION_REGEX = kwargs.get('MENTION_REGEX', "^<@(|[WU].+?)>(.*)")
         self.BOT_ID = kwargs.get('BOT_ID')
         self.registry = registry
+        self.web_client = None
+        self.rtm_client = None
 
     @classmethod
     def send(cls, message):
         """enqueue message in Slackish print queue"""
         cls.message_queue.append(message)
 
-    def parse_bot_commands(self, slack_events):
+    def parse_bot_commands(self, slack_event):
         """
             Parses a list of events coming from the Slack RTM API to find bot commands.
             If a bot command is found, this function returns a tuple of command and channel.
             If its not found, then this function returns None, None.
         """
-        for event in slack_events:
-            if event["type"] == "message" and not "subtype" in event:
-                user_id, message = self.parse_direct_mention(event["text"])
-                if user_id == self.BOT_ID:
-                    return message, event["channel"]
+        if "subtype" not in slack_event:
+            user_id, message = self.parse_direct_mention(slack_event["text"])
+            if user_id == self.BOT_ID:
+                return message, slack_event["channel"]
         return None, None
 
     def parse_direct_mention(self, message_text):
@@ -59,106 +75,80 @@ class Slackish(object):
         """
         matches = re.search(self.MENTION_REGEX, message_text)
         # the first group contains the username, the second group contains the remaining message
-        return (matches.group(1),
-                matches.group(2).strip()) if matches else (None, None)
+        return (matches.group(1), matches.group(2).strip()) if matches else (None, None)
 
-    def auth(self):
-        """set BOT_ID (bot user_id) using auth.test api"""
-        self.BOT_ID = self.slack_client.api_call("auth.test")["user_id"]
+    def serve(self):
+        if not self.BOT_ID:
+            self.BOT_ID = WebClient(token=self.token).api_call("auth.test")["user_id"]
+        logger.info("BOT serving loop started")
+        RTMClient(token=self.token).start()
 
-    def serve(self, registry=None):
-        if registry:
-            self.registry = registry
-        if self.slack_client.rtm_connect(with_team_state=False):
-            logger.info("Slackish Bot connected and authenticating!")
-            self.auth()
-            while True:
-                logger.info("BOT serving loop started")
-                command, channel = self.parse_bot_commands(
-                    self.slack_client.rtm_read())
-                self.channel = channel
-                logger.info("BOT received {} from channel: {}".format(
-                    command, channel))
-                if command:
-                    logger.info("handeling command: {}".format(command))
-                    self.handle(command, channel, registry=self.registry)
-                else:
-                    logger.info("No commands passed!")
-                sleep(self.RTM_READ_DELAY)
-        else:
-            logger.exception("Error while serving!")
+    def list_to_dict(self, alist):
+        """convert a list to a dictionary"""
+        it = iter(alist)
+        return dict(zip(it, it))
 
-    def detect_quoted_args(self, command):
-        logger.info("Detecting quoted args!!")
-        placeholders = {}
-        delta = 0
-        regex = r"\"[\w\s,.-;()]*\""
-        matches = re.finditer(regex, command, re.MULTILINE)
-        for match_num, match in enumerate(matches):
-            match_num = match_num + 1
-            placeholder = "sub{num}".format(num=match_num)
-            placeholders[placeholder.strip()] = match.group()[1:-1]
-            start_index = match.start()
-            end_index = match.end()
-            new_command = command[:start_index -
-                                  delta] + placeholder + command[end_index -
-                                                                 delta:]
-            delta = len(command) - len(new_command)
-            command = new_command
-        logger.info("detected: {}\n New command is:{}".format(placeholders, command))
-        return command, placeholders
-
-    def command_to_fn_call(self, command, registry):
+    def command_to_fn_call(self, command):
         logger.debug("converting command to function call!")
-        command, placeholders = self.detect_quoted_args(command)
-        command_words = command.split()
+
+        command_words = shlex.split(command)
         command_key = command_words[0].lower()
-        logger.debug("command key is {}".format(command_key))
+        logger.debug(f"command key is {command_key}")
         try:
-            cmd_function = registry[command_key]['cmd']
-            logger.info('Executing command {}!'.format(command_key))
-            kwargs = {}
-            for i, v in enumerate(command_words):
-                if i % 2:
-                    logger.debug(v.lower() + ": " + command_words[i + 1])
-                    kwargs[v.lower()] = placeholders.get(
-                        command_words[i + 1], command_words[i + 1])
+            cmd_function = self.registry[command_key]['cmd']
+            logger.info(f'Executing command {command_key}!')
+            kwargs = self.list_to_dict(command_words[1:])
             cmd_function(**kwargs)
+
         except KeyError as KE:
-            logger.debug("Command Key {} not found".format(command_key))
-            logger.debug("Registery: " + registry)
+            logger.debug(f"Command Key {command_key} not found")
+            logger.debug(f"Registery: {self.registry}")
             logger.debug(KE)
             self.error("Invalid command!")
             self.cmd_help()
-    
-    def cmd_help(self):
-        for cmd in self.registry:
-            self.post(self.registry[cmd]['help'])
+
+    def cmd_help(self, command=None):
+        if command:
+            self.post(self.registry[command]['help'])
+        else:
+            for cmd in self.registry:
+                self.post(self.registry[cmd]['help'])
 
     def post(self, message):
-        self.slack_client.api_call(
-            "chat.postMessage",
-            channel=self.channel,
-            text=message)
+        self.web_client.chat_postMessage(channel=self.channel, text=message)
 
     def error(self, error_message):
-        self.slack_client.api_call(
-            "chat.postMessage",
+        self.web_client.chat_postMessage(
             channel=self.channel,
-            text="Error: " + (error_message or self.default_error_message))
+            text=f"Error: {(error_message or self.default_error_message)}",
+        )
 
     def flush(self, message_queue):
         for message in message_queue:
             self.post(message)
 
-    def handle(self, command, channel, registry):
+    @slack.RTMClient.run_on(event='message')
+    def handle(**payload):
+        print(payload)
+        bot = Slackish()
+
+        command, channel = bot.parse_bot_commands(payload['data'])
+        if not command:
+            return
+
+        bot.channel = channel
+        bot.web_client = payload['web_client']
+        bot.rtm_client = payload['rtm_client']
+
+        logger.info(f"BOT received {command} from channel: {channel}")
+        logger.info(f"handeling command: {command}")
+
         try:
-            self.command_to_fn_call(command, registry)
-            self.flush(Slackish.message_queue)
-            Slackish.message_queue = []
+            bot.command_to_fn_call(command)
         except Exception as e:
-            logger.exception(e)
-            self.flush(Slackish.message_queue)
-            Slackish.message_queue = []
-            self.post("I'm sorry, I don't understand! ")
-            self.cmd_help()
+            logger.exception(f"Error {e} while excuting command {command}")
+            bot.post("I'm sorry, I don't understand! ")
+            bot.cmd_help()
+
+        bot.flush(Slackish.message_queue)
+        Slackish.message_queue = []
